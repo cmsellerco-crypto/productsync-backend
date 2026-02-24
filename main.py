@@ -18,20 +18,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── ScraperAPI config ────────────────────────────────────────────────────────
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "0a600af29843b12ea0ae1c13f89f1800")
-SCRAPER_API_URL = "https://api.scraperapi.com"
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# ─── Walmart Scraper via ScraperAPI ──────────────────────────────────────────
+# ─── Walmart Scraper ──────────────────────────────────────────────────────────
 
 async def scrape_walmart(brand: str, max_items: int, sort: str = "best_match"):
     products = []
-    page = 1
 
     sort_map = {
         "best_match": "best_match",
@@ -41,57 +33,97 @@ async def scrape_walmart(brand: str, max_items: int, sort: str = "best_match"):
     }
     sort_param = sort_map.get(sort, "best_match")
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    page = 1
+    async with httpx.AsyncClient(timeout=120) as client:
         while len(products) < max_items:
-            walmart_url = (
-                f"https://www.walmart.com/search?q={brand}"
-                f"&sort={sort_param}&page={page}&affinityOverride=default"
-            )
+            walmart_url = f"https://www.walmart.com/search?q={brand}&sort={sort_param}&page={page}"
 
-            # Route through ScraperAPI to bypass Walmart's bot detection
+            # Try ScraperAPI without render first (faster, cheaper)
             scraper_url = (
-                f"{SCRAPER_API_URL}/?api_key={SCRAPER_API_KEY}"
+                f"https://api.scraperapi.com/"
+                f"?api_key={SCRAPER_API_KEY}"
                 f"&url={walmart_url}"
-                f"&render=true"
                 f"&country_code=us"
+                f"&device_type=desktop"
             )
 
             try:
-                print(f"Fetching Walmart page {page} for brand: {brand}")
-                resp = await client.get(scraper_url, headers=HEADERS)
+                print(f"[Page {page}] Fetching: {walmart_url}")
+                resp = await client.get(scraper_url)
                 html = resp.text
+                print(f"[Page {page}] Status: {resp.status_code} | Length: {len(html)}")
 
-                print(f"Response status: {resp.status_code}, length: {len(html)}")
+                # Try multiple JSON extraction patterns
+                items = []
 
-                # Extract __NEXT_DATA__ JSON from Walmart's page
+                # Pattern 1: __NEXT_DATA__
                 match = re.search(
                     r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
                     html, re.DOTALL
                 )
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        # Try different paths in the JSON
+                        search_result = (
+                            data.get("props", {})
+                            .get("pageProps", {})
+                            .get("initialData", {})
+                            .get("searchResult", {})
+                        )
+                        for stack in search_result.get("itemStacks", []):
+                            items.extend(stack.get("items", []))
+                        print(f"[Page {page}] __NEXT_DATA__ items: {len(items)}")
+                    except Exception as e:
+                        print(f"[Page {page}] __NEXT_DATA__ parse error: {e}")
 
-                if not match:
-                    print(f"No __NEXT_DATA__ found on page {page}")
-                    break
+                # Pattern 2: Look for JSON in script tags with product data
+                if not items:
+                    patterns = [
+                        r'"searchResult"\s*:\s*(\{.*?"itemStacks".*?\})\s*[,}]',
+                        r'window\.__WML_REDUX_INITIAL_STATE__\s*=\s*(\{.*?\});',
+                    ]
+                    for pattern in patterns:
+                        m = re.search(pattern, html, re.DOTALL)
+                        if m:
+                            try:
+                                chunk = json.loads(m.group(1))
+                                for stack in chunk.get("itemStacks", []):
+                                    items.extend(stack.get("items", []))
+                                if items:
+                                    print(f"[Page {page}] Alt pattern items: {len(items)}")
+                                    break
+                            except:
+                                pass
 
-                data = json.loads(match.group(1))
-
-                item_stacks = (
-                    data.get("props", {})
-                    .get("pageProps", {})
-                    .get("initialData", {})
-                    .get("searchResult", {})
-                    .get("itemStacks", [])
-                )
-
-                items = []
-                for stack in item_stacks:
-                    items.extend(stack.get("items", []))
+                # Pattern 3: Walmart's structured data / JSON-LD
+                if not items:
+                    ld_matches = re.findall(
+                        r'<script type="application/ld\+json">(.*?)</script>',
+                        html, re.DOTALL
+                    )
+                    for ld in ld_matches:
+                        try:
+                            ld_data = json.loads(ld)
+                            if isinstance(ld_data, list):
+                                for entry in ld_data:
+                                    if entry.get("@type") == "Product":
+                                        items.append({
+                                            "name": entry.get("name", ""),
+                                            "brand": entry.get("brand", {}).get("name", brand) if isinstance(entry.get("brand"), dict) else brand,
+                                            "usItemId": "",
+                                            "upc": entry.get("gtin12", entry.get("gtin13", "")),
+                                            "priceInfo": {"currentPrice": {"price": entry.get("offers", {}).get("price", "")}},
+                                            "canonicalUrl": entry.get("url", "").replace("https://www.walmart.com", ""),
+                                        })
+                        except:
+                            pass
+                    if items:
+                        print(f"[Page {page}] JSON-LD items: {len(items)}")
 
                 if not items:
-                    print(f"No items found on page {page}")
+                    print(f"[Page {page}] No items found. HTML snippet: {html[:500]}")
                     break
-
-                print(f"Found {len(items)} items on page {page}")
 
                 for item in items:
                     if len(products) >= max_items:
@@ -102,39 +134,49 @@ async def scrape_walmart(brand: str, max_items: int, sort: str = "best_match"):
                         continue
 
                     price_info = item.get("priceInfo", {})
-                    price = price_info.get("currentPrice", {}).get("price", "")
-                    price_str = f"${price:.2f}" if isinstance(price, (int, float)) else ""
+                    price = ""
+                    if isinstance(price_info, dict):
+                        p = price_info.get("currentPrice", {})
+                        if isinstance(p, dict):
+                            raw = p.get("price", "")
+                            price = f"${float(raw):.2f}" if raw else ""
 
-                    upc = (
-                        item.get("upc") or
-                        item.get("upcCode") or
-                        item.get("GTIN") or
-                        ""
-                    )
+                    upc = str(item.get("upc") or item.get("upcCode") or item.get("GTIN") or "")
+                    category = item.get("category", "")
+                    if isinstance(category, dict):
+                        category = category.get("name", "")
+
+                    image = item.get("imageInfo", "")
+                    if isinstance(image, dict):
+                        image = image.get("thumbnailUrl", "")
+
+                    canonical = item.get("canonicalUrl", "")
+                    url = f"https://www.walmart.com{canonical}" if canonical.startswith("/") else canonical
 
                     products.append({
                         "name": name,
-                        "brand": item.get("brand", brand),
-                        "sku": item.get("usItemId", ""),
-                        "item_id": item.get("itemId", ""),
+                        "brand": item.get("brand", brand) or brand,
+                        "sku": str(item.get("usItemId", "")),
+                        "item_id": str(item.get("itemId", "")),
                         "upc": upc,
-                        "price": price_str,
-                        "category": item.get("category", {}).get("name", "") if isinstance(item.get("category"), dict) else "",
-                        "image": item.get("imageInfo", {}).get("thumbnailUrl", "") if isinstance(item.get("imageInfo"), dict) else "",
-                        "url": f"https://www.walmart.com{item.get('canonicalUrl', '')}",
+                        "price": price,
+                        "category": str(category),
+                        "image": str(image),
+                        "url": url,
                         "rating": str(item.get("averageRating", "")),
                         "source": "Walmart",
                         "asin": "",
                     })
 
+                print(f"[Page {page}] Collected so far: {len(products)}")
                 page += 1
-                await asyncio.sleep(1)
+                await asyncio.sleep(1.5)
 
             except Exception as e:
-                print(f"Walmart scrape error page {page}: {e}")
+                print(f"[Page {page}] Error: {e}")
                 break
 
-    print(f"Total products scraped: {len(products)}")
+    print(f"Total: {len(products)} products")
     return products
 
 
@@ -142,22 +184,17 @@ async def scrape_walmart(brand: str, max_items: int, sort: str = "best_match"):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "ProductSync API is running", "scraper": "ScraperAPI active"}
+    return {"status": "ok", "message": "ProductSync API running", "version": "2.0"}
 
 
 @app.get("/scrape/walmart")
 async def walmart_endpoint(
-    brand: str = Query(..., description="Brand name to search"),
+    brand: str = Query(...),
     max_items: int = Query(40, ge=1, le=200),
     sort: str = Query("best_match"),
 ):
     products = await scrape_walmart(brand, max_items, sort)
-    return {
-        "brand": brand,
-        "source": "walmart",
-        "count": len(products),
-        "products": products
-    }
+    return {"brand": brand, "source": "walmart", "count": len(products), "products": products}
 
 
 @app.get("/export/csv")
@@ -167,7 +204,6 @@ async def export_csv(
     sort: str = Query("best_match"),
 ):
     products = await scrape_walmart(brand, max_items, sort)
-
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=[
         "name", "brand", "sku", "item_id", "upc", "price",
@@ -176,7 +212,6 @@ async def export_csv(
     writer.writeheader()
     for p in products:
         writer.writerow({k: p.get(k, "") for k in writer.fieldnames})
-
     output.seek(0)
     filename = f"{brand.replace(' ', '_')}_products.csv"
     return StreamingResponse(
@@ -186,9 +221,25 @@ async def export_csv(
     )
 
 
+@app.get("/debug")
+async def debug_walmart(brand: str = Query("elf")):
+    """Returns raw HTML snippet to debug scraping issues"""
+    walmart_url = f"https://www.walmart.com/search?q={brand}&sort=best_match&page=1"
+    scraper_url = f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}&url={walmart_url}&country_code=us"
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(scraper_url)
+        html = resp.text
+        has_next_data = "__NEXT_DATA__" in html
+        has_items = "itemStacks" in html
+        return {
+            "status": resp.status_code,
+            "html_length": len(html),
+            "has_next_data": has_next_data,
+            "has_item_stacks": has_items,
+            "html_preview": html[:1000],
+        }
+
+
 @app.get("/health")
 def health():
-    return {
-        "status": "healthy",
-        "scraper_key_set": bool(SCRAPER_API_KEY),
-    }
+    return {"status": "healthy", "scraper_key_set": bool(SCRAPER_API_KEY)}
